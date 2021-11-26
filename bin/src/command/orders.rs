@@ -42,7 +42,7 @@ impl CommandServer {
         client_id: String,
         request: CommandRequest,
     ) -> anyhow::Result<OrderSuccess> {
-        info!("Received order {:?}", request);
+        trace!("Received request {:?}", request);
         let owned_client_id = client_id.to_owned();
         let owned_request_id = request.id.to_owned();
 
@@ -52,8 +52,7 @@ impl CommandServer {
             CommandRequestData::ListWorkers => self.list_workers().await,
             CommandRequestData::ListFrontends(filters) => self.list_frontends(filters).await,
             CommandRequestData::LoadState { path } => {
-                self.load_state(Some(owned_client_id), owned_request_id.to_owned(), &path)
-                    .await
+                self.load_state(owned_request_id.to_owned(), &path).await
             }
             CommandRequestData::LaunchWorker(tag) => {
                 self.launch_worker(owned_client_id, owned_request_id, &tag)
@@ -91,10 +90,10 @@ impl CommandServer {
 
                 let command_response_data = match order_success {
                     // should list OrderSuccess::Metrics(crd) as well
-                    OrderSuccess::DumpState(crd)
-                    | OrderSuccess::ListFrontends(crd)
-                    | OrderSuccess::ListWorkers(crd)
-                    | OrderSuccess::Query(crd) => Some(crd),
+                    OrderSuccess::DumpState(ref crd)
+                    | OrderSuccess::ListFrontends(ref crd)
+                    | OrderSuccess::ListWorkers(ref crd)
+                    | OrderSuccess::Query(ref crd) => Some(crd.clone()),
                     _ => None,
                 };
 
@@ -106,7 +105,7 @@ impl CommandServer {
                 )
                 .await;
 
-                Ok(OrderSuccess::ClientRequest)
+                Ok(order_success)
             }
             Err(error) => {
                 // no need to log the error here, it is down upstream
@@ -165,32 +164,17 @@ impl CommandServer {
 
     pub async fn dump_state(&mut self) -> anyhow::Result<OrderSuccess> {
         let state = self.state.clone();
-
+        info!("Dumping state...");
         Ok(OrderSuccess::DumpState(CommandResponseData::State(state)))
     }
 
     pub async fn load_state(
         &mut self,
-        client_id: Option<String>,
         message_id: String,
         path: &str,
     ) -> anyhow::Result<OrderSuccess> {
-        let mut file = match fs::File::open(&path) {
-            Err(e) => {
-                error!("cannot open file at path '{}': {:?}", path, e);
-                if let Some(id) = client_id {
-                    self.answer_error(
-                        id,
-                        message_id,
-                        format!("cannot open file at path '{}': {:?}", path, e),
-                        None,
-                    )
-                    .await;
-                }
-                return Err(anyhow::Error::from(e));
-            }
-            Ok(file) => file,
-        };
+        let mut file = fs::File::open(&path)
+            .with_context(|| format!("cannot open file at path '{}'", path))?;
 
         let mut buffer = Buffer::with_capacity(200000);
 
@@ -203,13 +187,10 @@ impl CommandServer {
         loop {
             let previous = buffer.available_data();
             //FIXME: we should read in streaming here
-            match file.read(buffer.space()) {
-                Ok(sz) => buffer.fill(sz),
-                Err(e) => {
-                    error!("error reading state file: {}", e);
-                    break;
-                }
-            };
+            let size = file
+                .read(buffer.space())
+                .with_context(|| "error reading state file")?;
+            buffer.fill(size);
 
             if buffer.available_data() == 0 {
                 debug!("Empty buffer");
@@ -218,29 +199,31 @@ impl CommandServer {
 
             let mut offset = 0usize;
             match parse(buffer.data()) {
-                Ok((i, orders)) => {
+                Ok((i, requests)) => {
                     if i.len() > 0 {
                         debug!("could not parse {} bytes", i.len());
                         if previous == buffer.available_data() {
-                            error!("error consuming load state message");
-                            break;
+                            bail!("error consuming load state message");
                         }
                     }
                     offset = buffer.data().offset(i);
 
-                    if orders.iter().find(|o| {
+                    if requests.iter().find(|o| {
                         if o.version > PROTOCOL_VERSION {
-                            error!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}", PROTOCOL_VERSION, o.version);
+                            error!(
+                                "configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}", PROTOCOL_VERSION, o.version
+                            );
                             true
                         } else {
                             false
                         }
                     }).is_some() {
+                        // maybe we should bail here
                         break;
                     }
 
-                    for message in orders {
-                        if let CommandRequestData::Proxy(order) = message.data {
+                    for request in requests {
+                        if let CommandRequestData::Proxy(order) = request.data {
                             message_counter += 1;
 
                             if self.state.handle_order(&order) {
@@ -263,7 +246,7 @@ impl CommandServer {
 
                                 if !found {
                                     // FIXME: should send back error here
-                                    error!("no worker found");
+                                    bail!("no worker found");
                                 }
                             }
                         }
@@ -271,43 +254,41 @@ impl CommandServer {
                 }
                 Err(Err::Incomplete(_)) => {
                     if buffer.available_data() == buffer.capacity() {
-                        error!(
+                        bail!(
                             "message too big, stopping parsing:\n{}",
                             buffer.data().to_hex(16)
                         );
-                        break;
                     }
                 }
                 Err(e) => {
-                    error!("saved state parse error: {:?}", e);
-                    break;
+                    bail!("saved state parse error: {:?}", e);
                 }
             }
             buffer.consume(offset);
         }
 
-        let client_tx = if let Some(id) = client_id.as_ref() {
-            self.clients.get(id).cloned()
-        } else {
-            None
-        };
-
-        error!("stopped loading data from file, remaining: {} bytes, saw {} messages, generated {} diff messages",
-        buffer.available_data(), message_counter, diff_counter);
-        let mut oks_and_errors: [usize; 2] = [0, 0];
+        info!(
+            "stopped loading data from file, remaining: {} bytes, saw {} messages, generated {} diff messages",
+            buffer.available_data(),
+            message_counter,
+            diff_counter
+        );
+        let oks_and_errors: [usize; 2];
         if diff_counter > 0 {
             info!(
                 "state loaded from {}, will start sending {} messages to workers",
                 path, diff_counter
             );
-            let task = smol::spawn(async move {
+            let task: smol::Task<[usize; 2]> = smol::spawn(async move {
                 let mut ok = 0usize;
                 let mut error = 0usize;
                 while let Some(proxy_response) = load_state_rx.next().await {
+                    debug!(
+                        "Received this proxy response from worker: {}",
+                        proxy_response
+                    );
                     match proxy_response.status {
-                        ProxyResponseStatus::Ok => {
-                            ok += 1;
-                        }
+                        ProxyResponseStatus::Ok => ok += 1,
                         ProxyResponseStatus::Processing => {}
                         ProxyResponseStatus::Error(message) => {
                             error!("{}", message);
@@ -317,48 +298,12 @@ impl CommandServer {
                     debug!("ok:{}, error: {}", ok, error);
                 }
 
-                if let Some(mut sender) = client_tx {
-                    if error == 0 {
-                        if let Err(e) = sender
-                            .send(CommandResponse::new(
-                                message_id.to_string(),
-                                CommandStatus::Ok,
-                                format!("ok: {} messages, error: 0", ok),
-                                None,
-                            ))
-                            .await
-                        {
-                            error!("could not send message to client {:?}: {:?}", client_id, e);
-                        }
-                    } else {
-                        if let Err(e) = sender
-                            .send(CommandResponse::new(
-                                message_id.to_string(),
-                                CommandStatus::Error,
-                                format!("ok: {} messages, error: {}", ok, error),
-                                None,
-                            ))
-                            .await
-                        {
-                            error!("could not send message to client {:?}: {:?}", client_id, e);
-                        }
-                    }
-                } else {
-                    if error == 0 {
-                        info!("loading state: {} ok messages, 0 errors", ok);
-                    } else {
-                        error!("loading state: {} ok messages, {} errors", ok, error);
-                    }
-                }
                 [ok, error]
             });
             oks_and_errors = task.await;
         } else {
             info!("no messages sent to workers: local state already had those messages");
-            if let Some(id) = client_id {
-                self.answer_success(id, message_id, format!("ok: 0 messages, error: 0"), None)
-                    .await;
-            }
+            oks_and_errors = [0, 0];
         }
 
         self.backends_count = self.state.count_backends();
@@ -445,7 +390,7 @@ impl CommandServer {
                 run_state: worker.run_state.clone(),
             })
             .collect();
-
+        info!("Listing workers...");
         Ok(OrderSuccess::ListWorkers(CommandResponseData::Workers(
             workers,
         )))

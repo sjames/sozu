@@ -69,6 +69,23 @@ enum CommandMessage {
     MasterStop,
 }
 
+impl std::fmt::Display for CommandMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::ClientNew { id, .. } => write!(f, "New client with id {}", id),
+            Self::ClientClose { id } => write!(f, "Close client with id {}", id),
+            Self::ClientRequest { id, message } => {
+                write!(f, "Request from client {} : {:?}", id, message)
+            }
+            Self::WorkerResponse { id, message } => {
+                write!(f, "Response from client {}: {:?}", id, message)
+            }
+            Self::WorkerClose { id } => write!(f, "Close worker {}", id),
+            Self::MasterStop => write!(f, "Master stop"),
+        }
+    }
+}
+
 pub enum OrderSuccess {
     ClientClose(String),
     ClientNew(String),
@@ -246,20 +263,21 @@ impl CommandServer {
 
     pub async fn run(&mut self) {
         while let Some(order) = self.command_rx.next().await {
+            debug!("Command server received an order: {}", order);
             let result: anyhow::Result<OrderSuccess> = match order {
                 CommandMessage::ClientNew { id, sender } => {
-                    debug!("adding new client {}", id);
+                    trace!("adding new client {}", id);
                     self.clients.insert(id.to_owned(), sender);
                     Ok(OrderSuccess::ClientNew(id))
                 }
                 CommandMessage::ClientClose { id } => {
-                    debug!("removing client {}", id);
+                    trace!("removing client {}", id);
                     self.clients.remove(&id);
                     self.event_subscribers.remove(&id);
                     Ok(OrderSuccess::ClientClose(id))
                 }
                 CommandMessage::ClientRequest { id, message } => {
-                    debug!("client {} sent {:?}", id, message);
+                    trace!("client {} sent this request: {:?}", id, message);
                     self.handle_client_request(id, message).await
                 }
                 CommandMessage::WorkerClose { id } => self
@@ -908,7 +926,7 @@ pub fn start_server(
 
         if let Some(path) = saved_state_path {
             server
-                .load_state(None, "INITIALIZATION".to_string(), &path)
+                .load_state("INITIALIZATION".to_string(), &path)
                 .await
                 .with_context(|| format!("Loading {:?} failed", &path))?;
         }
@@ -960,7 +978,7 @@ async fn client(
                 break;
             }
             Ok(message) => {
-                debug!("got message: {:?}", message);
+                trace!("Client {} got message: {:?}", id, message);
                 let id = id.clone();
                 if let Err(e) = tx.send(CommandMessage::ClientRequest { id, message }).await {
                     error!("error writing to client: {:?}", e);
