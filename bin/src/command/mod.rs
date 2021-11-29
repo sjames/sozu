@@ -78,7 +78,7 @@ impl std::fmt::Display for CommandMessage {
                 write!(f, "Request from client {} : {:?}", id, message)
             }
             Self::WorkerResponse { id, message } => {
-                write!(f, "Response from client {}: {:?}", id, message)
+                write!(f, "Response from worker {}: {:?}", id, message)
             }
             Self::WorkerClose { id } => write!(f, "Close worker {}", id),
             Self::MasterStop => write!(f, "Master stop"),
@@ -89,7 +89,6 @@ impl std::fmt::Display for CommandMessage {
 pub enum OrderSuccess {
     ClientClose(String),
     ClientNew(String),
-    ClientRequest,
     DumpState(CommandResponseData), // contains the cloned state
     LaunchWorker(u32),
     ListFrontends(CommandResponseData),
@@ -118,7 +117,6 @@ impl std::fmt::Display for OrderSuccess {
         match self {
             Self::ClientClose(id) => write!(f, "Close client: {}", id),
             Self::ClientNew(id) => write!(f, "New client successfully added: {}", id),
-            Self::ClientRequest => write!(f, "Successfully executed client request"),
             Self::DumpState(_) => write!(f, "Successfully gathered state from the main process"),
             Self::LaunchWorker(worker_id) => {
                 write!(f, "Successfully launched worker {}", worker_id)
@@ -179,7 +177,20 @@ pub struct CommandServer {
     command_rx: Receiver<CommandMessage>,
     clients: HashMap<String, Sender<CommandResponse>>,
     workers: Vec<Worker>,
-    in_flight: HashMap<String, (futures::channel::mpsc::Sender<ProxyResponse>, usize)>,
+    // A map of requests sent to workers.
+    // Any function requesting a serve will log in here, linking to each request id
+    // to a sender. This sender will be used to notify the fonction of the worker's
+    // response.
+    // In certain cases, the same response may need to be transmitted several
+    // times over. Therefore, a number is recorded next to the response tx in
+    // the hashmap.
+    in_flight: HashMap<
+        String, // the request id
+        (
+            futures::channel::mpsc::Sender<ProxyResponse>, // to notify whoever sent the Request
+            usize,                                         // the number of expected responses
+        ),
+    >,
     event_subscribers: HashSet<String>,
     state: ConfigState,
     config: Config,
@@ -296,7 +307,7 @@ impl CommandServer {
 
             match result {
                 Ok(order_success) => {
-                    debug!("Order OK: {}", order_success);
+                    // debug!("Order OK: {}", order_success);
 
                     // perform shutdowns
                     match order_success {
@@ -492,7 +503,7 @@ impl CommandServer {
         Ok(())
     }
 
-    pub async fn load_static_application_configuration(&mut self) {
+    pub async fn load_static_application_configuration(&mut self) -> anyhow::Result<()> {
         let (tx, mut rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
 
         let mut total_message_count = 0usize;
@@ -519,6 +530,7 @@ impl CommandServer {
                 if count == 0 {
                     // FIXME: should send back error here
                     error!("no worker found");
+                    bail!("No worker found to send orders to.");
                 } else {
                     self.in_flight
                         .insert(request.id.clone(), (tx.clone(), count));
@@ -569,6 +581,7 @@ impl CommandServer {
             }
         })
         .detach();
+        Ok(())
     }
 
     // in case a worker has crashed while Running and automatic_worker_restart is set to true
@@ -721,34 +734,46 @@ impl CommandServer {
         id: u32,
         message: ProxyResponse,
     ) -> anyhow::Result<OrderSuccess> {
-        debug!("worker {} sent back {:?}", id, message);
+        debug!("Worker {} responded with {:?}", id, message);
 
         // Notify the client with Processing in case of a proxy event
         if let Some(ProxyResponseData::Event(proxy_event)) = message.data {
             let event: Event = proxy_event.into();
             for client_id in self.event_subscribers.iter() {
-                if let Some(tx) = self.clients.get_mut(client_id) {
+                if let Some(client_tx) = self.clients.get_mut(client_id) {
                     let event = CommandResponse::new(
                         message.id.to_string(),
                         CommandStatus::Processing,
                         format!("{}", id),
                         Some(CommandResponseData::Event(event.clone())),
                     );
-                    tx.send(event).await.with_context(|| {
+                    client_tx.send(event).await.with_context(|| {
                         format!("could not send message to client {}", client_id)
                     })?
                 }
             }
             return Ok(OrderSuccess::PropagatedWorkerEvent);
         }
+
+        // The in_flight map has a record of every request sent to the workers.
+        // Each request is recorded with an response tx to send the response with.
+        // The method who recorded the request will listen on the corresponding rx.
+        //
+        // In certain cases, the same response may need to be transmitted several
+        // times over. Therefore, a number is recorded next to the response tx in
+        // the hashmap.
         match self.in_flight.remove(&message.id) {
             None => {
                 // FIXME: this messsage happens a lot at startup because AddCluster
                 // messages receive responses from each of the HTTP, HTTPS and TCP
                 // proxys. The clusters list should be merged
                 debug!("unknown message id: {}", message.id);
+                bail!(format!(
+                    "Can't find this message id in the in_flight: {}",
+                    message.id
+                ));
             }
-            Some((mut tx, mut nb)) => {
+            Some((mut response_tx, mut nb)) => {
                 let message_id = message.id.clone();
 
                 // if a worker returned Ok or Error, we're not expecting any more
@@ -760,12 +785,12 @@ impl CommandServer {
                     _ => {}
                 };
 
-                if tx.send(message.clone()).await.is_err() {
+                if response_tx.send(message.clone()).await.is_err() {
                     error!("Failed to send message: {}", message);
                 };
 
                 if nb > 0 {
-                    self.in_flight.insert(message_id, (tx, nb));
+                    self.in_flight.insert(message_id, (response_tx, nb));
                 }
             }
         }
@@ -922,9 +947,16 @@ pub fn start_server(
         let saved_state_path = config.saved_state.clone();
 
         let mut server = CommandServer::new(fd, config, tx, command_rx, workers, accept_cancel_tx)?;
-        server.load_static_application_configuration().await;
+        if server
+            .load_static_application_configuration()
+            .await
+            .is_err()
+        {
+            error!("Loading the static application failed");
+        }
 
         if let Some(path) = saved_state_path {
+            info!("Loading saved_state as configured: {}", path);
             server
                 .load_state("INITIALIZATION".to_string(), &path)
                 .await
@@ -1035,7 +1067,7 @@ async fn worker_loop(
                 break;
             }
             Ok(message) => {
-                debug!("worker {} replied message: {:?}", id, message);
+                debug!("worker {} responded: {:?}", id, message);
                 let id = id.clone();
                 tx.send(CommandMessage::WorkerResponse { id, message })
                     .await
