@@ -45,6 +45,7 @@ impl Worker {
     }
 
     pub async fn send(&mut self, request_id: String, data: ProxyRequestData) {
+        debug!("Sending the message {} to worker {}", request_id, self.id);
         if let Some(tx) = self.sender.as_mut() {
             if let Err(e) = tx
                 .send(ProxyRequest {

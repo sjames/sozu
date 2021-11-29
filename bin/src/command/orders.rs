@@ -227,8 +227,8 @@ impl CommandServer {
                             message_counter += 1;
 
                             if self.state.handle_order(&order) {
+                                debug!("Handling the order {} introduces a change", request.id);
                                 diff_counter += 1;
-
                                 let mut found = false;
                                 let id = format!("LOAD-STATE-{}-{}", message_id, diff_counter);
 
@@ -237,7 +237,9 @@ impl CommandServer {
                                         && worker.run_state != RunState::Stopped
                                 }) {
                                     let worker_message_id = format!("{}-{}", id, worker.id);
+                                   
                                     worker.send(worker_message_id.clone(), order.clone()).await;
+                                    
                                     self.in_flight
                                         .insert(worker_message_id, (load_state_tx.clone(), 1));
 

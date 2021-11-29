@@ -498,8 +498,8 @@ impl CommandServer {
         let mut total_message_count = 0usize;
 
         //FIXME: too many loops, this could be cleaner
-        for message in self.config.generate_config_messages() {
-            if let CommandRequestData::Proxy(order) = message.data {
+        for request in self.config.generate_config_messages() {
+            if let CommandRequestData::Proxy(order) = request.data {
                 self.state.handle_order(&order);
 
                 if let &ProxyRequestData::AddCertificate(_) = &order {
@@ -512,7 +512,7 @@ impl CommandServer {
                 for ref mut worker in self.workers.iter_mut().filter(|worker| {
                     worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
                 }) {
-                    worker.send(message.id.clone(), order.clone()).await;
+                    worker.send(request.id.clone(), order.clone()).await;
                     count += 1;
                 }
 
@@ -521,7 +521,7 @@ impl CommandServer {
                     error!("no worker found");
                 } else {
                     self.in_flight
-                        .insert(message.id.clone(), (tx.clone(), count));
+                        .insert(request.id.clone(), (tx.clone(), count));
                     total_message_count += count;
                 }
             }
@@ -607,73 +607,75 @@ impl CommandServer {
             tcp: Vec::new(),
         });
 
-        if let Ok(mut worker) = start_worker(
+        let mut worker = start_worker(
             id,
             &self.config,
             self.executable_path.clone(),
             &self.state,
             listeners,
-        ) {
-            info!("created new worker: {}", id);
-            self.next_id += 1;
+        )
+        .with_context(|| format!("Could not start new worker {}", id))?;
 
-            let sock = worker.channel.take().unwrap().sock;
-            let (worker_tx, worker_rx) = channel(10000);
-            worker.sender = Some(worker_tx);
+        info!("created new worker: {}", id);
+        self.next_id += 1;
 
-            let stream = Async::new(unsafe {
-                let fd = sock.into_raw_fd();
-                UnixStream::from_raw_fd(fd)
-            })?;
+        let sock = worker.channel.take().unwrap().sock;
+        let (worker_tx, worker_rx) = channel(10000);
+        worker.sender = Some(worker_tx);
 
-            let id = worker.id;
-            let command_tx = self.command_tx.clone();
-            smol::spawn(async move {
-                worker_loop(id, stream, command_tx, worker_rx)
-                    .await
-                    .unwrap();
-            })
-            .detach();
+        let stream = Async::new(unsafe {
+            let fd = sock.into_raw_fd();
+            UnixStream::from_raw_fd(fd)
+        })?;
 
-            let mut count = 0usize;
-            let mut orders = self.state.generate_activate_orders();
-            for order in orders.drain(..) {
-                if let Err(e) = worker
-                    .sender
-                    .as_mut()
-                    .unwrap()
-                    .send(ProxyRequest {
-                        id: format!("RESTART-{}-ACTIVATE-{}", id, count),
-                        order,
-                    })
-                    .await
-                {
-                    error!(
-                        "could not send activate order to worker {:?}: {:?}",
-                        worker.id, e
-                    );
-                }
-                count += 1;
-            }
+        let id = worker.id;
+        let command_tx = self.command_tx.clone();
+        smol::spawn(async move {
+            worker_loop(id, stream, command_tx, worker_rx)
+                .await
+                .unwrap();
+        })
+        .detach();
 
+        let mut count = 0usize;
+        let mut orders = self.state.generate_activate_orders();
+        for order in orders.drain(..) {
             if let Err(e) = worker
                 .sender
                 .as_mut()
                 .unwrap()
                 .send(ProxyRequest {
-                    id: format!("RESTART-{}-STATUS", id),
-                    order: ProxyRequestData::Status,
+                    id: format!("RESTART-{}-ACTIVATE-{}", id, count),
+                    order,
                 })
                 .await
             {
                 error!(
-                    "could not send status message to worker {:?}: {:?}",
+                    "could not send activate order to worker {:?}: {:?}",
                     worker.id, e
                 );
             }
-
-            self.workers.push(worker);
+            count += 1;
         }
+
+        if let Err(e) = worker
+            .sender
+            .as_mut()
+            .unwrap()
+            .send(ProxyRequest {
+                id: format!("RESTART-{}-STATUS", id),
+                order: ProxyRequestData::Status,
+            })
+            .await
+        {
+            error!(
+                "could not send status message to worker {:?}: {:?}",
+                worker.id, e
+            );
+        }
+
+        self.workers.push(worker);
+
         Ok(())
     }
 
@@ -720,8 +722,10 @@ impl CommandServer {
         message: ProxyResponse,
     ) -> anyhow::Result<OrderSuccess> {
         debug!("worker {} sent back {:?}", id, message);
-        if let Some(ProxyResponseData::Event(data)) = message.data {
-            let event: Event = data.into();
+
+        // Notify the client with Processing in case of a proxy event
+        if let Some(ProxyResponseData::Event(proxy_event)) = message.data {
+            let event: Event = proxy_event.into();
             for client_id in self.event_subscribers.iter() {
                 if let Some(tx) = self.clients.get_mut(client_id) {
                     let event = CommandResponse::new(
@@ -846,7 +850,7 @@ pub fn start_server(
             .with_context(|| format!("could not delete previous socket at {:?}", addr))?;
     }
 
-    let srv = match UnixListener::bind(&addr) {
+    let unix_listener = match UnixListener::bind(&addr) {
         Err(e) => {
             error!("could not create unix socket: {:?}", e);
             // the workers did not even get the configuration, we can kill them right away
@@ -858,29 +862,25 @@ pub fn start_server(
             }
             bail!("couldn't start server");
         }
-        Ok(srv) => {
-            if let Err(e) = fs::set_permissions(&addr, fs::Permissions::from_mode(0o600)) {
-                error!("could not set the unix socket permissions: {:?}", e);
-                let _ = fs::remove_file(&addr).map_err(|e2| {
-                    error!("could not remove the unix socket: {:?}", e2);
-                });
-                // the workers did not even get the configuration, we can kill them right away
-                for worker in workers {
-                    error!("killing worker n°{} (PID {})", worker.id, worker.pid);
-                    let _ = kill(Pid::from_raw(worker.pid), Signal::SIGKILL).map_err(|e| {
-                        error!("could not kill worker: {:?}", e);
-                    });
-                }
-                bail!("couldn't start server");
-            }
-            srv
-        }
+        Ok(unix_listener) => unix_listener,
     };
+
+    if fs::set_permissions(&addr, fs::Permissions::from_mode(0o600)).is_err() {
+        fs::remove_file(&addr).with_context(|| "could not remove the unix socket")?;
+
+        // the workers did not even get the configuration, we can kill them right away
+        for worker in workers {
+            error!("killing worker n°{} (PID {})", worker.id, worker.pid);
+            kill(Pid::from_raw(worker.pid), Signal::SIGKILL)
+                .with_context(|| format!("could not kill worker {}", worker.id))?;
+        }
+        bail!("couldn't set the unix socket permissions");
+    }
 
     future::block_on(async {
         // Create a listener.
-        let fd = srv.as_raw_fd();
-        let listener = Async::new(srv)?;
+        let fd = unix_listener.as_raw_fd();
+        let listener = Async::new(unix_listener)?;
         info!("Listening on {:?}", listener.get_ref().local_addr()?);
 
         let mut counter = 0usize;
@@ -890,10 +890,10 @@ pub fn start_server(
         smol::spawn(async move {
             let mut accept_cancel_rx = Some(accept_cancel_rx);
             loop {
-                let f = listener.accept();
-                futures::pin_mut!(f);
+                let fut = listener.accept();
+                futures::pin_mut!(fut);
                 let (stream, _) =
-                    match futures::future::select(accept_cancel_rx.take().unwrap(), f).await {
+                    match futures::future::select(accept_cancel_rx.take().unwrap(), fut).await {
                         futures::future::Either::Left((_canceled, _)) => {
                             info!("stopping listener");
                             break;
@@ -940,6 +940,7 @@ pub fn start_server(
     })
 }
 
+// Creates a client, typically for command-line
 async fn client(
     id: String,
     stream: Async<UnixStream>,
@@ -981,14 +982,14 @@ async fn client(
                 trace!("Client {} got message: {:?}", id, message);
                 let id = id.clone();
                 if let Err(e) = tx.send(CommandMessage::ClientRequest { id, message }).await {
-                    error!("error writing to client: {:?}", e);
+                    error!("error writing to command server: {:?}", e);
                 }
             }
         }
     }
 
     if let Err(e) = tx.send(CommandMessage::ClientClose { id }).await {
-        error!("error writing to client: {:?}", e);
+        error!("error writing to command server: {:?}", e);
     }
     Ok(())
 }
@@ -1002,6 +1003,7 @@ async fn worker_loop(
     let stream = Arc::new(stream);
     let mut s = stream.clone();
 
+    // write everything from the receiver onto the unix stream
     smol::spawn(async move {
         debug!("will start sending messages to worker {}", id);
         while let Some(msg) = rx.next().await {
@@ -1015,6 +1017,7 @@ async fn worker_loop(
     })
     .detach();
 
+    // parse ProxyResponses from the unix stream and send them to the CommandServer
     debug!("will start receiving messages from worker {}", id);
     let mut it = BufReader::new(stream).split(0);
     while let Some(message) = it.next().await {
