@@ -63,6 +63,9 @@ enum CommandMessage {
         id: u32,
         message: ProxyResponse,
     },
+    OrderResponse {
+        order_success: anyhow::Result<OrderSuccess>,
+    },
     WorkerClose {
         id: u32,
     },
@@ -80,12 +83,16 @@ impl std::fmt::Display for CommandMessage {
             Self::WorkerResponse { id, message } => {
                 write!(f, "Response from worker {}: {:?}", id, message)
             }
+            Self::OrderResponse { order_success } => {
+                write!(f, "Order success: {:?}", order_success)
+            }
             Self::WorkerClose { id } => write!(f, "Close worker {}", id),
             Self::MasterStop => write!(f, "Master stop"),
         }
     }
 }
 
+#[derive(Debug)]
 pub enum OrderSuccess {
     ClientClose(String),
     ClientNew(String),
@@ -125,7 +132,7 @@ impl std::fmt::Display for OrderSuccess {
             Self::ListWorkers(_) => write!(f, "Listed all workers"),
             Self::LoadState(path, ok, error) => write!(
                 f,
-                "Successfully loaded state from path {}, {} ok messages, {} errors",
+                "Successfully loaded state from path {}, ok: {}, errors: {}",
                 path, ok, error
             ),
             Self::MasterStop => write!(f, "stopping main process"),
@@ -178,11 +185,11 @@ pub struct CommandServer {
     clients: HashMap<String, Sender<CommandResponse>>,
     workers: Vec<Worker>,
     // A map of requests sent to workers.
-    // Any function requesting a serve will log in here, linking to each request id
-    // to a sender. This sender will be used to notify the fonction of the worker's
+    // Any function requesting a worker will log the request id in here, associated
+    // with a sender. This sender will be used to notify the function of the worker's
     // response.
     // In certain cases, the same response may need to be transmitted several
-    // times over. Therefore, a number is recorded next to the response tx in
+    // times over. Therefore, a number is recorded next to the sender in
     // the hashmap.
     in_flight: HashMap<
         String, // the request id
@@ -299,6 +306,7 @@ impl CommandServer {
                     .handle_worker_response(id, message)
                     .await
                     .with_context(|| "Could not handle worker response"),
+                CommandMessage::OrderResponse { order_success } => order_success,
                 CommandMessage::MasterStop => {
                     info!("stopping main process");
                     Ok(OrderSuccess::MasterStop)
@@ -732,17 +740,17 @@ impl CommandServer {
     async fn handle_worker_response(
         &mut self,
         id: u32,
-        message: ProxyResponse,
+        response: ProxyResponse,
     ) -> anyhow::Result<OrderSuccess> {
-        debug!("Worker {} responded with {:?}", id, message);
+        debug!("Worker {} responded with {:?}", id, response);
 
         // Notify the client with Processing in case of a proxy event
-        if let Some(ProxyResponseData::Event(proxy_event)) = message.data {
+        if let Some(ProxyResponseData::Event(proxy_event)) = response.data {
             let event: Event = proxy_event.into();
             for client_id in self.event_subscribers.iter() {
                 if let Some(client_tx) = self.clients.get_mut(client_id) {
                     let event = CommandResponse::new(
-                        message.id.to_string(),
+                        response.id.to_string(),
                         CommandStatus::Processing,
                         format!("{}", id),
                         Some(CommandResponseData::Event(event.clone())),
@@ -755,42 +763,40 @@ impl CommandServer {
             return Ok(OrderSuccess::PropagatedWorkerEvent);
         }
 
-        // The in_flight map has a record of every request sent to the workers.
-        // Each request is recorded with an response tx to send the response with.
-        // The method who recorded the request will listen on the corresponding rx.
-        //
-        // In certain cases, the same response may need to be transmitted several
-        // times over. Therefore, a number is recorded next to the response tx in
-        // the hashmap.
-        match self.in_flight.remove(&message.id) {
+        // Notify the function that sent the request (to which we received the response).
+        // The in_flight map contains the id of each request sent, together with a sender
+        // we use to send the response to.
+        match self.in_flight.remove(&response.id) {
             None => {
                 // FIXME: this messsage happens a lot at startup because AddCluster
                 // messages receive responses from each of the HTTP, HTTPS and TCP
                 // proxys. The clusters list should be merged
-                debug!("unknown message id: {}", message.id);
+                debug!("unknown message id: {}", response.id);
                 bail!(format!(
                     "Can't find this message id in the in_flight: {}",
-                    message.id
+                    response.id
                 ));
             }
             Some((mut response_tx, mut nb)) => {
-                let message_id = message.id.clone();
+                let request_id = response.id.clone();
 
                 // if a worker returned Ok or Error, we're not expecting any more
                 // messages with this id from it
-                match message.status {
+                match response.status {
                     ProxyResponseStatus::Ok | ProxyResponseStatus::Error(_) => {
                         nb -= 1;
                     }
                     _ => {}
                 };
 
-                if response_tx.send(message.clone()).await.is_err() {
-                    error!("Failed to send message: {}", message);
+                if response_tx.send(response.clone()).await.is_err() {
+                    error!("Failed to send message: {}", response);
                 };
 
+                // rewrite the removed entry into the in_flight map. It will we reused
+                // until nb is 0.
                 if nb > 0 {
-                    self.in_flight.insert(message_id, (response_tx, nb));
+                    self.in_flight.insert(request_id, (response_tx, nb));
                 }
             }
         }
@@ -875,6 +881,7 @@ pub fn start_server(
             .with_context(|| format!("could not delete previous socket at {:?}", addr))?;
     }
 
+    // get_uni_listener(&addr, &worker);
     let unix_listener = match UnixListener::bind(&addr) {
         Err(e) => {
             error!("could not create unix socket: {:?}", e);
@@ -908,7 +915,8 @@ pub fn start_server(
         let listener = Async::new(unix_listener)?;
         info!("Listening on {:?}", listener.get_ref().local_addr()?);
 
-        let mut counter = 0usize;
+        // The client-spawning loop
+        let mut client_counter = 0usize;
         let (accept_cancel_tx, accept_cancel_rx) = oneshot::channel();
         let (mut command_tx, command_rx) = channel(10000);
         let tx = command_tx.clone();
@@ -930,7 +938,7 @@ pub fn start_server(
                     };
 
                 let (client_tx, client_rx) = channel(10000);
-                let id = format!("CL-{}", counter);
+                let id = format!("CL-{}", client_counter);
                 smol::spawn(client(id.clone(), stream, command_tx.clone(), client_rx)).detach();
                 command_tx
                     .send(CommandMessage::ClientNew {
@@ -939,7 +947,7 @@ pub fn start_server(
                     })
                     .await
                     .unwrap();
-                counter += 1;
+                client_counter += 1;
             }
         })
         .detach();
@@ -983,9 +991,9 @@ async fn client(
     let mut s = stream.clone();
 
     smol::spawn(async move {
-        while let Some(msg) = rx.next().await {
+        while let Some(response) = rx.next().await {
             //info!("sending back message to client: {:?}", msg);
-            let mut message: Vec<u8> = serde_json::to_string(&msg)
+            let mut message: Vec<u8> = serde_json::to_string(&response)
                 .map(|s| s.into_bytes())
                 .unwrap_or_else(|_| Vec::new());
             message.push(0);
@@ -1029,18 +1037,18 @@ async fn client(
 async fn worker_loop(
     id: u32,
     stream: Async<UnixStream>,
-    mut tx: Sender<CommandMessage>,
-    mut rx: Receiver<ProxyRequest>,
+    mut command_tx: Sender<CommandMessage>,
+    mut worker_rx: Receiver<ProxyRequest>,
 ) -> std::io::Result<()> {
     let stream = Arc::new(stream);
     let mut s = stream.clone();
 
-    // write everything from the receiver onto the unix stream
+    // write everything destined to the worker onto the unix stream
     smol::spawn(async move {
         debug!("will start sending messages to worker {}", id);
-        while let Some(msg) = rx.next().await {
-            debug!("sending to worker {}: {:?}", id, msg);
-            let mut message: Vec<u8> = serde_json::to_string(&msg)
+        while let Some(request) = worker_rx.next().await {
+            debug!("sending to worker {}: {:?}", id, request);
+            let mut message: Vec<u8> = serde_json::to_string(&request)
                 .map(|s| s.into_bytes())
                 .unwrap_or_else(|_| Vec::new());
             message.push(0);
@@ -1069,14 +1077,19 @@ async fn worker_loop(
             Ok(message) => {
                 debug!("worker {} responded: {:?}", id, message);
                 let id = id.clone();
-                tx.send(CommandMessage::WorkerResponse { id, message })
+                command_tx
+                    .send(CommandMessage::WorkerResponse { id, message })
                     .await
                     .unwrap();
             }
         }
     }
 
-    tx.send(CommandMessage::WorkerClose { id }).await.unwrap();
+    // when the loop is over, close the worker
+    command_tx
+        .send(CommandMessage::WorkerClose { id })
+        .await
+        .unwrap();
 
     Ok(())
 }

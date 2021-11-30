@@ -1,7 +1,9 @@
 use anyhow::{bail, Context};
 use async_io::Async;
-use futures::channel::mpsc::*;
-use futures::{SinkExt, StreamExt};
+use futures::{
+    channel::{mpsc::*, oneshot},
+    SinkExt, StreamExt,
+};
 use nom::{Err, HexDisplay, IResult, Offset};
 use serde_json;
 use std::{
@@ -35,6 +37,7 @@ use crate::{
     upgrade::start_new_main_process,
     worker::start_worker,
 };
+
 
 impl CommandServer {
     pub async fn handle_client_request(
@@ -237,13 +240,13 @@ impl CommandServer {
                                     worker.run_state != RunState::Stopping
                                         && worker.run_state != RunState::Stopped
                                 }) {
-                                    let worker_message_id = format!("{}-{}", id, worker.id);
+                                    let worker_request_id = format!("{}-{}", id, worker.id);
 
-                                    worker.send(worker_message_id.clone(), order.clone()).await;
+                                    worker.send(worker_request_id.clone(), order.clone()).await;
 
-                                    // are those actually recorded? listening to load_state.rx hangs
+                                    
                                     self.in_flight
-                                        .insert(worker_message_id, (load_state_tx.clone(), 1));
+                                        .insert(worker_request_id, (load_state_tx.clone(), 1));
 
                                     found = true;
                                 }
@@ -277,13 +280,15 @@ impl CommandServer {
             message_counter,
             diff_counter
         );
-        let oks_and_errors: [usize; 2];
         if diff_counter > 0 {
             info!(
                 "state loaded from {}, {} have messages have been sent to workers",
                 path, diff_counter
             );
-            let task: smol::Task<[usize; 2]> = smol::spawn(async move {
+
+            let mut command_tx = self.command_tx.clone();
+
+            smol::spawn(async move {
                 let mut ok = 0usize;
                 let mut error = 0usize;
                 debug!("hi");
@@ -303,12 +308,19 @@ impl CommandServer {
                     debug!("ok:{}, error: {}", ok, error);
                 }
 
-                [ok, error]
-            });
-            oks_and_errors = task.await;
+                command_tx
+                    .send(CommandMessage::OrderResponse {
+                        order_success: Ok(OrderSuccess::LoadState(
+                            "Finished loading state".to_string(),
+                            ok,
+                            error,
+                        )),
+                    })
+                    .await
+            })
+            .detach();
         } else {
             info!("no messages sent to workers: local state already had those messages");
-            oks_and_errors = [0, 0];
         }
 
         self.backends_count = self.state.count_backends();
@@ -316,22 +328,15 @@ impl CommandServer {
         gauge!("configuration.clusters", self.state.clusters.len());
         gauge!("configuration.backends", self.backends_count);
         gauge!("configuration.frontends", self.frontends_count);
-        match oks_and_errors[0] {
-            0 => Ok(OrderSuccess::LoadState(
-                path.to_string(),
-                oks_and_errors[0],
-                oks_and_errors[1],
-            )),
-            _ => bail!(format!(
-                "Partially loaded stated: {} ok, {} errors",
-                oks_and_errors[0], oks_and_errors[1]
-            )),
-        }
+        Ok(OrderSuccess::LoadState(
+            "Loading state, waiting for the order response".to_string(),
+            0,
+            0,
+        ))
     }
 
     pub async fn list_frontends(
         &mut self,
-
         filters: FrontendFilters,
     ) -> anyhow::Result<OrderSuccess> {
         info!(
@@ -407,21 +412,14 @@ impl CommandServer {
         request_id: String,
         _tag: &str,
     ) -> anyhow::Result<OrderSuccess> {
-        let mut worker = match start_worker(
+        let mut worker = start_worker(
             self.next_id,
             &self.config,
             self.executable_path.clone(),
             &self.state,
             None,
-        ) {
-            Ok(worker) => worker,
-            Err(e) => {
-                error!("Failed at creating worker");
-                self.answer_error(client_id, request_id, "failed creating worker", None)
-                    .await;
-                return Err(e);
-            }
-        };
+        )
+        .with_context(|| format!("Failed at creating worker {}", self.next_id))?;
 
         if let Some(sender) = self.clients.get_mut(&client_id) {
             if let Err(e) = sender
@@ -489,8 +487,6 @@ impl CommandServer {
         }
 
         self.workers.push(worker);
-
-        self.answer_success(client_id, request_id, "", None).await;
 
         Ok(OrderSuccess::LaunchWorker(id))
     }
@@ -745,7 +741,6 @@ impl CommandServer {
         info!("sent config messages to the new worker");
         self.workers.push(worker);
 
-        self.answer_success(client_id, request_id, "", None).await;
         info!("finished upgrade");
         Ok(OrderSuccess::UpgradeWorker(id))
     }
